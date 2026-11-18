@@ -592,11 +592,89 @@ Loop:
 	return nil
 }
 
+// anyWire is the binary encoding of a message as a linked list of chunks.
+// Nested Any values are wrapped by prepending a small envelope chunk. The
+// payload chunks themselves are not copied until the outermost Any is stored,
+// so a chain of N Any messages is encoded in O(N) time and allocations.
+type anyWire struct {
+	chunk []byte
+	next  *anyWire
+	n     int
+}
+
+func flatWire(b []byte) anyWire {
+	if len(b) == 0 {
+		return anyWire{}
+	}
+	return anyWire{chunk: b, n: len(b)}
+}
+
+func consWire(head []byte, rest anyWire) anyWire {
+	if rest.n == 0 {
+		return anyWire{chunk: head, n: len(head)}
+	}
+	restCopy := rest
+	return anyWire{chunk: head, next: &restCopy, n: len(head) + rest.n}
+}
+
+// bytes returns the concatenated encoding. A single chunk is returned
+// directly; a chain is copied once into a fresh buffer.
+func (w anyWire) bytes() []byte {
+	if w.n == 0 {
+		return nil
+	}
+	if w.next == nil {
+		return w.chunk
+	}
+	b := make([]byte, 0, w.n)
+	for p := &w; p != nil; p = p.next {
+		b = append(b, p.chunk...)
+	}
+	return b
+}
+
+// wrapAnyWire returns the wire encoding of an Any with the given type URL and
+// embedded message. Empty type_url and value are omitted, matching
+// proto.Marshal of a google.protobuf.Any.
+func wrapAnyWire(typeURL string, inner anyWire) anyWire {
+	var head []byte
+	if typeURL != "" {
+		head = protowire.AppendTag(head, genid.Any_TypeUrl_field_number, protowire.BytesType)
+		head = protowire.AppendString(head, typeURL)
+	}
+	if inner.n > 0 {
+		head = protowire.AppendTag(head, genid.Any_Value_field_number, protowire.BytesType)
+		head = protowire.AppendVarint(head, uint64(inner.n))
+	}
+	if len(head) == 0 {
+		return anyWire{}
+	}
+	return consWire(head, inner)
+}
+
 // unmarshalAny unmarshals an Any textproto. It can either be in expanded form
 // or non-expanded form.
 func (d decoder) unmarshalAny(m protoreflect.Message, checkDelims bool) error {
+	typeURL, bValue, err := d.unmarshalAnyFields(checkDelims)
+	if err != nil {
+		return err
+	}
+	fds := m.Descriptor().Fields()
+	if len(typeURL) > 0 {
+		m.Set(fds.ByNumber(genid.Any_TypeUrl_field_number), protoreflect.ValueOfString(typeURL))
+	}
+	if b := bValue.bytes(); len(b) > 0 {
+		m.Set(fds.ByNumber(genid.Any_Value_field_number), protoreflect.ValueOfBytes(b))
+	}
+	return nil
+}
+
+// unmarshalAnyFields parses an Any body and returns its type_url and the
+// embedded message bytes. Those bytes are Any.value, not the encoding of the
+// Any itself.
+func (d decoder) unmarshalAnyFields(checkDelims bool) (string, anyWire, error) {
 	var typeURL string
-	var bValue []byte
+	var bValue anyWire
 	var seenTypeUrl bool
 	var seenValue bool
 	var isExpanded bool
@@ -604,11 +682,11 @@ func (d decoder) unmarshalAny(m protoreflect.Message, checkDelims bool) error {
 	if checkDelims {
 		tok, err := d.Read()
 		if err != nil {
-			return err
+			return "", anyWire{}, err
 		}
 
 		if tok.Kind() != text.MessageOpen {
-			return d.unexpectedTokenError(tok)
+			return "", anyWire{}, d.unexpectedTokenError(tok)
 		}
 	}
 
@@ -618,7 +696,7 @@ Loop:
 		// value and type URL name inside [].
 		tok, err := d.Read()
 		if err != nil {
-			return err
+			return "", anyWire{}, err
 		}
 		if typ := tok.Kind(); typ != text.Name {
 			if checkDelims {
@@ -628,101 +706,108 @@ Loop:
 			} else if typ == text.EOF {
 				break Loop
 			}
-			return d.unexpectedTokenError(tok)
+			return "", anyWire{}, d.unexpectedTokenError(tok)
 		}
 
 		switch tok.NameKind() {
 		case text.IdentName:
 			// Both type_url and value fields require field separator :.
 			if !tok.HasSeparator() {
-				return d.syntaxError(tok.Pos(), "missing field separator :")
+				return "", anyWire{}, d.syntaxError(tok.Pos(), "missing field separator :")
 			}
 
 			switch name := protoreflect.Name(tok.IdentName()); name {
 			case genid.Any_TypeUrl_field_name:
 				if seenTypeUrl {
-					return d.newError(tok.Pos(), "duplicate %v field", genid.Any_TypeUrl_field_fullname)
+					return "", anyWire{}, d.newError(tok.Pos(), "duplicate %v field", genid.Any_TypeUrl_field_fullname)
 				}
 				if isExpanded {
-					return d.newError(tok.Pos(), "conflict with [%s] field", typeURL)
+					return "", anyWire{}, d.newError(tok.Pos(), "conflict with [%s] field", typeURL)
 				}
 				tok, err := d.Read()
 				if err != nil {
-					return err
+					return "", anyWire{}, err
 				}
 				var ok bool
 				typeURL, ok = tok.String()
 				if !ok {
-					return d.newError(tok.Pos(), "invalid %v field value: %v", genid.Any_TypeUrl_field_fullname, tok.RawString())
+					return "", anyWire{}, d.newError(tok.Pos(), "invalid %v field value: %v", genid.Any_TypeUrl_field_fullname, tok.RawString())
 				}
 				seenTypeUrl = true
 
 			case genid.Any_Value_field_name:
 				if seenValue {
-					return d.newError(tok.Pos(), "duplicate %v field", genid.Any_Value_field_fullname)
+					return "", anyWire{}, d.newError(tok.Pos(), "duplicate %v field", genid.Any_Value_field_fullname)
 				}
 				if isExpanded {
-					return d.newError(tok.Pos(), "conflict with [%s] field", typeURL)
+					return "", anyWire{}, d.newError(tok.Pos(), "conflict with [%s] field", typeURL)
 				}
 				tok, err := d.Read()
 				if err != nil {
-					return err
+					return "", anyWire{}, err
 				}
 				s, ok := tok.String()
 				if !ok {
-					return d.newError(tok.Pos(), "invalid %v field value: %v", genid.Any_Value_field_fullname, tok.RawString())
+					return "", anyWire{}, d.newError(tok.Pos(), "invalid %v field value: %v", genid.Any_Value_field_fullname, tok.RawString())
 				}
-				bValue = []byte(s)
+				bValue = flatWire([]byte(s))
 				seenValue = true
 
 			default:
 				if !d.opts.DiscardUnknown {
-					return d.newError(tok.Pos(), "invalid field name %q in %v message", tok.RawString(), genid.Any_message_fullname)
+					return "", anyWire{}, d.newError(tok.Pos(), "invalid field name %q in %v message", tok.RawString(), genid.Any_message_fullname)
 				}
 			}
 
 		case text.TypeName:
 			if isExpanded {
-				return d.newError(tok.Pos(), "cannot have more than one type")
+				return "", anyWire{}, d.newError(tok.Pos(), "cannot have more than one type")
 			}
 			if seenTypeUrl {
-				return d.newError(tok.Pos(), "conflict with type_url field")
+				return "", anyWire{}, d.newError(tok.Pos(), "conflict with type_url field")
 			}
 			typeURL = tok.TypeName()
 			var err error
 			bValue, err = d.unmarshalExpandedAny(typeURL, tok.Pos())
 			if err != nil {
-				return err
+				return "", anyWire{}, err
 			}
 			isExpanded = true
 
 		default:
 			if !d.opts.DiscardUnknown {
-				return d.newError(tok.Pos(), "invalid field name %q in %v message", tok.RawString(), genid.Any_message_fullname)
+				return "", anyWire{}, d.newError(tok.Pos(), "invalid field name %q in %v message", tok.RawString(), genid.Any_message_fullname)
 			}
 		}
 	}
 
-	fds := m.Descriptor().Fields()
-	if len(typeURL) > 0 {
-		m.Set(fds.ByNumber(genid.Any_TypeUrl_field_number), protoreflect.ValueOfString(typeURL))
-	}
-	if len(bValue) > 0 {
-		m.Set(fds.ByNumber(genid.Any_Value_field_number), protoreflect.ValueOfBytes(bValue))
-	}
-	return nil
+	return typeURL, bValue, nil
 }
 
-func (d decoder) unmarshalExpandedAny(typeURL string, pos int) ([]byte, error) {
+func (d decoder) unmarshalExpandedAny(typeURL string, pos int) (anyWire, error) {
 	mt, err := d.opts.Resolver.FindMessageByURL(typeURL)
 	if err != nil {
-		return nil, d.newError(pos, "unable to resolve message [%v]: %v", typeURL, err)
+		return anyWire{}, d.newError(pos, "unable to resolve message [%v]: %v", typeURL, err)
+	}
+	// A nested Any is already encoded by the recursive parse. Framing that
+	// encoding avoids proto.Marshal, which would copy the whole subtree at
+	// every level. RecursionLimit is decremented here because this path does
+	// not go through unmarshalMessage.
+	if mt.Descriptor().FullName() == genid.Any_message_fullname {
+		if d.opts.RecursionLimit--; d.opts.RecursionLimit < 0 {
+			return anyWire{}, errRecursionDepth
+		}
+		innerURL, inner, err := d.unmarshalAnyFields(true)
+		if err != nil {
+			return anyWire{}, err
+		}
+		return wrapAnyWire(innerURL, inner), nil
 	}
 	// Create new message for the embedded message type and unmarshal the value
 	// field into it.
 	m := mt.New()
 	if err := d.unmarshalMessage(m, true); err != nil {
-		return nil, err
+		return anyWire{}, err
 	}
 	// Serialize the embedded message and return the resulting bytes.
 	b, err := proto.MarshalOptions{
@@ -730,9 +815,9 @@ func (d decoder) unmarshalExpandedAny(typeURL string, pos int) ([]byte, error) {
 		Deterministic: true,
 	}.Marshal(m.Interface())
 	if err != nil {
-		return nil, d.newError(pos, "error in marshaling message into Any.value: %v", err)
+		return anyWire{}, d.newError(pos, "error in marshaling message into Any.value: %v", err)
 	}
-	return b, nil
+	return flatWire(b), nil
 }
 
 // skipValue makes the decoder parse a field value in order to advance the read
